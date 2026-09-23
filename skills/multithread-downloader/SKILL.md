@@ -1,0 +1,90 @@
+---
+name: multithread-downloader
+description: 下载 HTTP/HTTPS 直接文件链接，使用多线程分片、按分片断点续传、分片与最终文件校验，并在验证和正式文件发布成功后清理临时分片。用于下载压缩包、安装包、模型、直接文件视频等单个资源；不负责网页解析、浏览器登录、BT、磁力链接或批量下载队列。
+---
+
+# 多线程下载器
+
+用本 skill 自带的 `scripts/download.py` 完成下载，不临时重写下载逻辑，不通过 shell `cat` 合并分片。运行环境为 Python 3.9+，下载器仅依赖标准库。
+
+## 调用
+
+1. 确认 HTTP/HTTPS 直接文件 URL 与输出文件的**绝对路径**。用户没有指定文件名时可以根据链接建议文件名，但不要信任响应中的路径或文件名来决定落盘位置。
+2. 有可信预期 SHA-256 时使用 `--sha256`；没有时允许基础校验，必须如实说明校验级别。不能把本次下载后自己计算的哈希当作可信预期值。
+3. 将 `<SKILL_DIR>` 替换为当前 `SKILL.md` 所在目录的绝对路径后执行：
+
+```bash
+python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
+  --output "/absolute/path/file.zip" --json
+```
+
+可信哈希校验：
+
+```bash
+python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
+  --output "/absolute/path/file.zip" --sha256 "<64位可信SHA-256>" --json
+```
+
+4. 长时间下载使用终端会话继续等待，直到得到最终结果；不能把“进程已启动”当成下载成功。进度写入 stderr，最终 JSON 写入 stdout。
+5. 根据结果中的 `verification` 和 `temporary_parts_cleaned` 汇报，提供实际输出路径、字节数、SHA-256；如果是基础校验，明确说“大小与分片结构校验通过，未验证内容哈希”。
+
+## 默认行为和约束
+
+- 默认 8 个线程，可选 1～32；每片 64 MiB，可用 `--chunk-size` 修改；分片少时不启动多余线程。
+- 每个失败分片额外重试最多 3 次，等待 1、2、4 秒。请求级网络阻塞超时默认 30 秒；这不是整个任务的截止时间。
+- 通过实际 `Range: bytes=0-0` 请求探测，不仅依赖 `Accept-Ranges` 声明。检查每片的状态码、字节范围、总大小、正文长度及资源版本。
+- 没有分片支持时改用单线程；虽支持分片但既无强 ETag 又无可信预期 SHA-256 时，同样保守地改用单线程，避免混合版本。
+- 单线程从头重下，不承诺续传。若最终仍没有预期总大小或可信 SHA-256，保留临时文件并报告完整性无法确认，不生成正式文件。
+- 多线程恢复时逐片重新计算哈希，只复用完整且记录匹配的分片；半片和坏片从该片起点重下。URL、请求头、最终重定向目标、远端版本、分片大小或预期哈希变化时停止，不混用旧任务。
+- 下载后先完整检查全部分片，再按连续范围顺序合并；合并过程中再次检查每片，合并后重新读取文件检查大小、合并一致性，以及可选的可信 SHA-256。
+- 正式文件默认不覆盖。**只有用户明确允许覆盖时**才加 `--overwrite`；即使允许覆盖，也保留原文件直到新文件校验成功。
+- 不自动添加 `--restart`。需要重新开始时先说明原因并取得用户同意；它将旧任务保留为 `retained-*`，而不是删除旧分片。
+- 只在新文件验证且原子发布成功后清理本次 `active` 目录。失败、中断和校验不符保留临时文件；此前的 `retained-*` 不自动清理。
+- 同一输出路径有进程锁。成功后保留隐藏工作目录中的 `.lock`，它不是分片也不保存凭据，不要在有任务运行时删除它。
+
+## 鉴权与安全
+
+带鉴权或签名链接时读取 [请求参数、续传及故障处理](references/usage.md)。优先使用 `--url-file` 和 `--headers-file`，避免把 URL 签名、Cookie、令牌直接放到命令行历史。不要回显这些文件内容。
+
+不读取浏览器 Cookie，不自动登录；不把鉴权信息提交到外部服务。运行记录只保存请求标识的 SHA-256 摘要，不保存原始 URL 或请求头。跨源重定向丢弃所有用户请求头；拒绝 HTTPS 降级为 HTTP。TLS 验证保持开启，不提供跳过证书校验选项。
+
+## 验证与可移植性
+
+下载脚本支持 macOS、Linux、Windows 的实现路径，不代表每个系统都已实机验证。行为测试命令：
+
+```bash
+python3 -m unittest discover -s "<SKILL_DIR>/tests" -v
+```
+
+测试使用本地 HTTP 服务和临时文件；HTTPS 测试通过系统 `openssl` 临时生成测试证书，缺少该测试工具时跳过这两项，**不影响下载器运行，也不应把跳过视为通过**。不使用真实账号、外部资源或浏览器。
+
+## 创建可安装的自定义 skill 仓库
+
+当用户要求准备自己的 skill 仓库时，运行本 skill 自带的初始化脚本，而不是手工拼接目录或直接覆盖已有文件：
+
+```bash
+python3 "<SKILL_DIR>/scripts/init_skill_repo.py" --json
+```
+
+默认创建 `~/project/skills` Git 仓库，并把当前 skill 复制为
+`skills/multithread-downloader/`；仓库已有内容会保留，已存在的同名 skill 不会被覆盖。
+脚本会创建 `README.md`、`.gitignore`，执行 `git init` 和初始提交。若只要空仓库骨架：
+
+```bash
+python3 "<SKILL_DIR>/scripts/init_skill_repo.py" --empty-repo --json
+```
+
+仓库结构遵循 `npx skills` 的发现约定：每个 `skills/<skill-name>/` 目录包含一个带
+`name` 和 `description` frontmatter 的 `SKILL.md`。将仓库推送到 GitHub 后，安装单个 skill：
+
+```bash
+npx skills add <github-owner>/<repository> --skill multithread-downloader
+```
+
+安装全部 skill：
+
+```bash
+npx skills add <github-owner>/<repository> --all
+```
+
+初始化脚本只负责本地目录、Git 和 skill 文件，不会替用户创建远程 GitHub 仓库、推送代码或执行安装。

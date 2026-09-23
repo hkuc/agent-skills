@@ -1,0 +1,17 @@
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Node dependencies and build output
+node_modules/
+dist/
+build/

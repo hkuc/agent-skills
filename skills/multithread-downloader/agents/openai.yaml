@@ -1,0 +1,4 @@
+interface:
+  display_name: "多线程下载器"
+  short_description: "HTTP/HTTPS 多线程分片下载、断点续传、完整性校验与安全合并清理"
+  default_prompt: "使用 $multithread-downloader 下载指定 HTTP/HTTPS 文件，校验分片与最终文件，只在验证成功后清理临时分片。"
