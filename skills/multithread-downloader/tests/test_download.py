@@ -182,6 +182,21 @@ class DownloaderTests(unittest.TestCase):
             expected = sorted("bytes=%d-%d" % (i, min(i + CHUNK, len(PAYLOAD)) - 1) for i in range(0, len(PAYLOAD), CHUNK))
             self.assertEqual(actual, expected)
 
+    def test_realtime_progress_reports_speed_and_eta(self):
+        with Fixture(delay=0.08) as server:
+            result, process = self.invoke(server.url, "--threads", "1", "--progress", "plain")
+            self.check_success(result)
+            self.assertIn("下载进度：", process.stderr)
+            self.assertIn("速度：", process.stderr)
+            self.assertIn("剩余：", process.stderr)
+            self.assertIn("100.0%", process.stderr)
+
+    def test_progress_can_be_disabled(self):
+        with Fixture() as server:
+            result, process = self.invoke(server.url, "--progress", "none")
+            self.check_success(result)
+            self.assertNotIn("下载进度：", process.stderr)
+
     def test_default_chunk_size_64_mib_actual_ranges(self):
         data = bytes(range(256)) * (256 * 1024) + b"tail"
         with Fixture(data=data) as server:

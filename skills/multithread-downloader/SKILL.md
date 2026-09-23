@@ -25,7 +25,19 @@ python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
   --output "/absolute/path/file.zip" --sha256 "<64位可信SHA-256>" --json
 ```
 
-4. 长时间下载使用终端会话继续等待，直到得到最终结果；不能把“进程已启动”当成下载成功。进度写入 stderr，最终 JSON 写入 stdout。
+进度显示默认自动适配当前输出环境：交互式终端使用单行动态刷新，日志或管道使用逐行输出。进度包含百分比、已完成大小、速度、预计剩余时间和分片数；可显式选择：
+
+```bash
+# 适合 CI、日志和重定向，逐行输出
+python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
+  --output "/absolute/path/file.zip" --progress plain --json
+
+# 关闭进度，仅保留必要状态和最终结果
+python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
+  --output "/absolute/path/file.zip" --progress none --json
+```
+
+4. 长时间下载使用终端会话继续等待，直到得到最终结果；不能把“进程已启动”当成下载成功。进度写入 stderr，最终 JSON 写入 stdout；使用 `--json` 时不会把进度混入 JSON。
 5. 根据结果中的 `verification` 和 `temporary_parts_cleaned` 汇报，提供实际输出路径、字节数、SHA-256；如果是基础校验，明确说“大小与分片结构校验通过，未验证内容哈希”。
 
 ## 默认行为和约束

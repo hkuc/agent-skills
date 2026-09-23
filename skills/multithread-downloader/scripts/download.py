@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BUFFER = 256 * 1024
 USER_AGENT = "multithread-downloader/" + VERSION
 RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
@@ -48,6 +48,136 @@ def digest_text(text):
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def format_bytes(value):
+    value = float(max(value, 0))
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return "%d B" % value
+            return "%.1f %s" % (value, unit)
+        value /= 1024
+    return "%.1f TiB" % value
+
+
+def format_duration(seconds):
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return "--"
+    seconds = int(seconds + 0.5)
+    if seconds < 60:
+        return "%ds" % seconds
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return "%dm %02ds" % (minutes, seconds)
+    hours, minutes = divmod(minutes, 60)
+    return "%dh %02dm" % (hours, minutes)
+
+
+class PieceProgress:
+    """Count one attempt and roll it back if the attempt must be retried."""
+    def __init__(self, reporter):
+        self.reporter = reporter
+        self.bytes = 0
+
+    def add(self, amount):
+        self.bytes += amount
+        self.reporter.add(amount)
+
+    def rollback(self):
+        if self.bytes:
+            self.reporter.rollback(self.bytes)
+            self.bytes = 0
+
+
+class ProgressReporter:
+    """Thread-safe progress output that is safe for terminals and log pipes."""
+    def __init__(self, total, mode="auto", initial_bytes=0, initial_parts=0,
+                 total_parts=None, stream=None):
+        self.total = total
+        self.mode = mode
+        self.stream = stream or sys.stderr
+        self.dynamic = mode == "auto" and bool(getattr(self.stream, "isatty", lambda: False)())
+        self.enabled = mode != "none"
+        self.current = max(initial_bytes, 0)
+        self.downloaded = 0
+        self.completed_parts = initial_parts
+        self.total_parts = total_parts
+        self.started = time.monotonic()
+        self.last_report = 0.0
+        self.last_length = 0
+        self.lock = threading.Lock()
+
+    def _line(self):
+        elapsed = max(time.monotonic() - self.started, 0.001)
+        speed = self.downloaded / elapsed
+        if self.total is None:
+            percent = None
+        elif self.total == 0:
+            percent = 100.0
+        else:
+            percent = min(100.0, 100.0 * self.current / self.total)
+        eta = None
+        if self.total is not None and speed > 0:
+            eta = max(0.0, (self.total - self.current) / speed)
+        if percent is None:
+            progress = format_bytes(self.current)
+        else:
+            progress = "%.1f%%" % percent
+        line = "下载进度：%s | %s" % (progress, format_bytes(self.current))
+        if self.total is not None:
+            line += "/%s" % format_bytes(self.total)
+        line += " | 速度：%s/s | 剩余：%s" % (format_bytes(speed), format_duration(eta))
+        if self.total_parts is not None:
+            line += " | 分片：%d/%d" % (self.completed_parts, self.total_parts)
+        return line
+
+    def _write(self, line):
+        if self.dynamic:
+            padding = max(self.last_length - len(line), 0)
+            self.stream.write("\r" + line + (" " * padding))
+            self.last_length = len(line)
+        else:
+            self.stream.write(line + "\n")
+        self.stream.flush()
+
+    def _report_locked(self, force=False):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_report < 0.5:
+            return
+        self.last_report = now
+        self._write(self._line())
+
+    def add(self, amount):
+        with self.lock:
+            self.current = max(0, self.current + amount)
+            if amount > 0:
+                self.downloaded += amount
+            self._report_locked()
+
+    def rollback(self, amount):
+        with self.lock:
+            self.current = max(0, self.current - amount)
+            self.downloaded = max(0, self.downloaded - amount)
+            self._report_locked()
+
+    def complete_part(self):
+        with self.lock:
+            self.completed_parts += 1
+            self._report_locked()
+
+    def finish(self):
+        with self.lock:
+            if not self.enabled:
+                return
+            self._report_locked(force=True)
+            if self.dynamic and self.last_length:
+                self.stream.write("\n")
+                self.stream.flush()
+                self.last_length = 0
 
 
 def check_cancel(stop):
@@ -333,7 +463,7 @@ def conditional_headers(remote):
     return {"If-Match": remote["etag"]} if remote["etag"] else {}
 
 
-def stream_to_file(response, path, expected, stop):
+def stream_to_file(response, path, expected, stop, on_bytes=None):
     size, digest = 0, hashlib.sha256()
     with open_private(path) as stream:
         while True:
@@ -348,6 +478,8 @@ def stream_to_file(response, path, expected, stop):
                 raise DownloadError("响应正文超出预期分片长度。", 4)
             stream.write(block)
             digest.update(block)
+            if on_bytes is not None:
+                on_bytes(len(block))
         stream.flush()
         os.fsync(stream.fileno())
     if expected is not None and size != expected:
@@ -426,33 +558,38 @@ def download_parts(client, active, state, remote, args):
     pending = iter(index for index in range(count) if str(index) not in state["completed"])
     mutex = threading.Lock()
     errors = []
-    progress_at = [0.0]
-    progress_bytes = [sum(record["size"] for record in state["completed"].values())]
+    initial_bytes = sum(record["size"] for record in state["completed"].values())
     threads = min(args.threads, max(count - resumed, 1))
+    progress = ProgressReporter(total, args.progress, initial_bytes, resumed, count)
     log("分片模式：%d 个分片，最多 %d 个线程，复用 %d 个已验证分片。" % (count, threads, resumed))
 
     def fetch(index):
-        start = index * args.chunk_size
-        end = min(start + args.chunk_size, total) - 1
-        headers = {**conditional_headers(remote), "Range": "bytes=%d-%d" % (start, end)}
-        if remote["etag"]:
-            headers["If-Range"] = remote["etag"]
-        with client.open(headers) as response:
-            same_response(response, remote)
-            if response.status != 206:
-                raise DownloadError("分片请求不再返回 206，保留现场；请确认后 --restart 重新探测。", 5)
-            match = RANGE_RE.fullmatch(response.headers.get("Content-Range", ""))
-            if not match or tuple(map(int, match.groups())) != (start, end, total):
-                raise DownloadError("分片 Content-Range 与请求范围不符。", 4)
-            length = content_length(response)
-            if length is not None and length != end - start + 1:
-                raise DownloadError("分片 Content-Length 不正确。", 4)
-            temporary = active / (part_name(index) + ".partial")
-            record = stream_to_file(response, temporary, end - start + 1, client.stop)
-        target = active / part_name(index)
-        require_regular(target)
-        os.replace(str(temporary), str(target))
-        return record
+        tracker = PieceProgress(progress)
+        try:
+            start = index * args.chunk_size
+            end = min(start + args.chunk_size, total) - 1
+            headers = {**conditional_headers(remote), "Range": "bytes=%d-%d" % (start, end)}
+            if remote["etag"]:
+                headers["If-Range"] = remote["etag"]
+            with client.open(headers) as response:
+                same_response(response, remote)
+                if response.status != 206:
+                    raise DownloadError("分片请求不再返回 206，保留现场；请确认后 --restart 重新探测。", 5)
+                match = RANGE_RE.fullmatch(response.headers.get("Content-Range", ""))
+                if not match or tuple(map(int, match.groups())) != (start, end, total):
+                    raise DownloadError("分片 Content-Range 与请求范围不符。", 4)
+                length = content_length(response)
+                if length is not None and length != end - start + 1:
+                    raise DownloadError("分片 Content-Length 不正确。", 4)
+                temporary = active / (part_name(index) + ".partial")
+                record = stream_to_file(response, temporary, end - start + 1, client.stop, tracker.add)
+            target = active / part_name(index)
+            require_regular(target)
+            os.replace(str(temporary), str(target))
+            return record
+        except BaseException:
+            tracker.rollback()
+            raise
 
     def worker():
         try:
@@ -465,11 +602,7 @@ def download_parts(client, active, state, remote, args):
                 with mutex:
                     state["completed"][str(index)] = record
                     save_json(active / "manifest.json", state)
-                    progress_bytes[0] += record["size"]
-                    now = time.monotonic()
-                    if now - progress_at[0] >= 1 or progress_bytes[0] == total:
-                        log("已完成 %d/%d 字节（%.1f%%）。" % (progress_bytes[0], total, 100 * progress_bytes[0] / total))
-                        progress_at[0] = now
+                    progress.complete_part()
         except BaseException as error:
             with mutex:
                 errors.append(error)
@@ -485,6 +618,7 @@ def download_parts(client, active, state, remote, args):
         raise
     finally:
         pool.shutdown(wait=True)
+        progress.finish()
     if errors:
         raise errors[0]
     check_cancel(client.stop)
@@ -527,20 +661,30 @@ def merge_parts(active, count, state, stop):
     return candidate, size, aggregate.hexdigest()
 
 
-def download_single(client, active, state, remote):
+def download_single(client, active, state, remote, progress_mode="auto"):
+    progress = ProgressReporter(remote["size"], progress_mode)
+
     def attempt():
-        with client.open(conditional_headers(remote)) as response:
-            same_response(response, remote)
-            if response.status != 200:
-                raise DownloadError("单线程请求没有返回完整文件（200）。", 4)
-            length = content_length(response)
-            if remote["size"] is not None and length is not None and length != remote["size"]:
-                raise DownloadError("单线程响应的总大小发生变化。", 5)
-            expected = remote["size"] if remote["size"] is not None else length
-            record = stream_to_file(response, active / "single.partial", expected, client.stop)
-            return record, expected
+        tracker = PieceProgress(progress)
+        try:
+            with client.open(conditional_headers(remote)) as response:
+                same_response(response, remote)
+                if response.status != 200:
+                    raise DownloadError("单线程请求没有返回完整文件（200）。", 4)
+                length = content_length(response)
+                if remote["size"] is not None and length is not None and length != remote["size"]:
+                    raise DownloadError("单线程响应的总大小发生变化。", 5)
+                expected = remote["size"] if remote["size"] is not None else length
+                record = stream_to_file(response, active / "single.partial", expected, client.stop, tracker.add)
+                return record, expected
+        except BaseException:
+            tracker.rollback()
+            raise
     log("已降级为单线程完整下载。")
-    record, expected = client.retry(attempt, "单线程下载")
+    try:
+        record, expected = client.retry(attempt, "单线程下载")
+    finally:
+        progress.finish()
     target = active / part_name(0)
     require_regular(target)
     os.replace(str(active / "single.partial"), str(target))
@@ -644,7 +788,7 @@ def run(args, stop):
             candidate, size, sha = merge_parts(active, count, state, stop)
             expected_size = remote["size"]
         else:
-            candidate, size, sha, expected_size = download_single(client, active, state, remote)
+            candidate, size, sha, expected_size = download_single(client, active, state, remote, args.progress)
             count, resumed, threads = 1, 0, 1
         size, sha = verify_candidate(candidate, size, sha, expected_size, args.sha256, stop)
         check_cancel(stop)
@@ -690,6 +834,10 @@ def parse_args(argv=None):
     parser.add_argument("--headers-file", help="自定义请求头 JSON 文件，不会写入日志或续传记录")
     parser.add_argument("--overwrite", action="store_true", help="仅在新文件验证通过后原子替换原文件")
     parser.add_argument("--restart", action="store_true", help="保留旧 active 为 retained 目录，开启全新下载")
+    parser.add_argument("--progress", choices=("auto", "plain", "none"), default="auto",
+                        help="进度显示：auto 自动适配终端，plain 逐行输出，none 关闭；默认 auto")
+    parser.add_argument("--no-progress", dest="progress", action="store_const", const="none",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="stdout 输出单个 JSON 结果；进度写 stderr")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
