@@ -57,34 +57,3 @@ python3 -m unittest discover -s "<SKILL_DIR>/tests" -v
 ```
 
 测试使用本地 HTTP 服务和临时文件；HTTPS 测试通过系统 `openssl` 临时生成测试证书，缺少该测试工具时跳过这两项，**不影响下载器运行，也不应把跳过视为通过**。不使用真实账号、外部资源或浏览器。
-
-## 创建可安装的自定义 skill 仓库
-
-当用户要求准备自己的 skill 仓库时，运行本 skill 自带的初始化脚本，而不是手工拼接目录或直接覆盖已有文件：
-
-```bash
-python3 "<SKILL_DIR>/scripts/init_skill_repo.py" --json
-```
-
-默认创建 `~/project/skills` Git 仓库，并把当前 skill 复制为
-`skills/multithread-downloader/`；仓库已有内容会保留，已存在的同名 skill 不会被覆盖。
-脚本会创建 `README.md`、`.gitignore`，执行 `git init` 和初始提交。若只要空仓库骨架：
-
-```bash
-python3 "<SKILL_DIR>/scripts/init_skill_repo.py" --empty-repo --json
-```
-
-仓库结构遵循 `npx skills` 的发现约定：每个 `skills/<skill-name>/` 目录包含一个带
-`name` 和 `description` frontmatter 的 `SKILL.md`。将仓库推送到 GitHub 后，安装单个 skill：
-
-```bash
-npx skills add <github-owner>/<repository> --skill multithread-downloader
-```
-
-安装全部 skill：
-
-```bash
-npx skills add <github-owner>/<repository> --all
-```
-
-初始化脚本只负责本地目录、Git 和 skill 文件，不会替用户创建远程 GitHub 仓库、推送代码或执行安装。
