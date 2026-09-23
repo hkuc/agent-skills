@@ -22,14 +22,14 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+DEFAULT_USER_AGENT = "multithread-downloader/" + VERSION
 BUFFER = 256 * 1024
-USER_AGENT = "multithread-downloader/" + VERSION
 RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 RESERVED_HEADERS = {
     "range", "if-range", "if-match", "if-none-match", "if-modified-since",
-    "if-unmodified-since", "accept-encoding", "host", "content-length",
+    "if-unmodified-since", "accept-encoding", "user-agent", "host", "content-length",
     "transfer-encoding", "connection", "proxy-authorization", "expect",
 }
 
@@ -293,6 +293,10 @@ def origin(url):
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, user_agent=DEFAULT_USER_AGENT):
+        super().__init__()
+        self.user_agent = user_agent
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         validate_url(newurl)
         if origin(req.full_url)[0] == "https" and origin(newurl)[0] == "http":
@@ -304,8 +308,20 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
             internal = {"range", "if-range", "if-match", "accept-encoding"}
             redirected.headers = {k: v for k, v in redirected.headers.items() if k.lower() in internal}
             redirected.unredirected_hdrs = {}
-            redirected.add_header("User-Agent", USER_AGENT)
+            redirected.add_header("User-Agent", self.user_agent)
         return redirected
+
+
+def validate_user_agent(value):
+    if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise DownloadError("User-Agent 必须是非空且不含控制字符的文本。", 2)
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        raise DownloadError("User-Agent 必须可按 Latin-1 编码。", 2) from None
+    if len(value) > 512:
+        raise DownloadError("User-Agent 长度不能超过 512 个字符。", 2)
+    return value
 
 
 def load_headers(path):
@@ -335,9 +351,10 @@ def load_headers(path):
 
 
 class Client:
-    def __init__(self, url, headers, timeout, retries, stop):
+    def __init__(self, url, headers, timeout, retries, stop, user_agent=DEFAULT_USER_AGENT):
         self.url, self.headers = url, headers
         self.timeout, self.retries, self.stop = timeout, retries, stop
+        self.user_agent = validate_user_agent(user_agent)
         # Explicitly honor CA environment settings, including macOS Python builds
         # whose LibreSSL defaults do not load SSL_CERT_FILE automatically.
         self.tls_context = ssl.create_default_context(
@@ -347,10 +364,10 @@ class Client:
 
     def open(self, extra):
         check_cancel(self.stop)
-        headers = {"User-Agent": USER_AGENT, **self.headers, "Accept-Encoding": "identity", **extra}
+        headers = {"User-Agent": self.user_agent, **self.headers, "Accept-Encoding": "identity", **extra}
         request = urllib.request.Request(self.url, headers=headers, method="GET")
         # An opener per call avoids shared mutable redirect/handler state.
-        opener = urllib.request.build_opener(SafeRedirect(), urllib.request.HTTPSHandler(context=self.tls_context))
+        opener = urllib.request.build_opener(SafeRedirect(self.user_agent), urllib.request.HTTPSHandler(context=self.tls_context))
         try:
             return opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
@@ -759,7 +776,8 @@ def run(args, stop):
             raise DownloadError("无法读取 URL 文件。", 2) from None
     validate_url(url)
     headers = load_headers(args.headers_file)
-    request_hash = digest_text(json.dumps({"url": url, "headers": headers}, sort_keys=True))
+    request_hash = digest_text(json.dumps({"url": url, "headers": headers,
+                                           "user_agent": args.user_agent}, sort_keys=True))
     requested = Path(args.output).expanduser().absolute()
     requested.parent.mkdir(parents=True, exist_ok=True)
     target = requested.parent.resolve() / requested.name
@@ -771,7 +789,7 @@ def run(args, stop):
             raise DownloadError("目标文件已存在；未覆盖。请更换输出路径或显式指定 --overwrite。", 5)
         if active.is_symlink():
             raise DownloadError("临时任务目录不能是符号链接。", 6)
-        client = Client(url, headers, args.timeout, args.retries, stop)
+        client = Client(url, headers, args.timeout, args.retries, stop, args.user_agent)
         remote = probe(client)
         mode = "parallel" if remote["ranges"] and (remote["etag"] or args.sha256) else "single"
         if remote["ranges"] and mode == "single":
@@ -832,6 +850,8 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=float, default=30, help="单次网络阻塞超时秒数，默认 30；不是任务总时限")
     parser.add_argument("--sha256", help="可信来源提供的 64 位十六进制 SHA-256")
     parser.add_argument("--headers-file", help="自定义请求头 JSON 文件，不会写入日志或续传记录")
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT,
+                        help="请求 User-Agent；默认使用可识别的下载器标识，可传浏览器 User-Agent")
     parser.add_argument("--overwrite", action="store_true", help="仅在新文件验证通过后原子替换原文件")
     parser.add_argument("--restart", action="store_true", help="保留旧 active 为 retained 目录，开启全新下载")
     parser.add_argument("--progress", choices=("auto", "plain", "none"), default="auto",
@@ -853,6 +873,10 @@ def parse_args(argv=None):
         args.sha256 = args.sha256.lower()
         if not HASH_RE.fullmatch(args.sha256):
             parser.error("--sha256 必须是 64 位十六进制。")
+    try:
+        validate_user_agent(args.user_agent)
+    except DownloadError as error:
+        parser.error(str(error))
     return args
 
 

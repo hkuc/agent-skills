@@ -103,6 +103,19 @@ python3 "<SKILL_DIR>/scripts/download.py" \
 
 若单线程任务在成功接收后仍无总大小也无可信哈希，返回 4，保留文件供检查。不要通过关闭校验把它改报成功。
 
+## User-Agent
+
+下载器始终发送 User-Agent，默认值为 `multithread-downloader/<版本>`，便于识别真实的下载器请求。部分站点会拦截非浏览器请求时，可显式传入浏览器 User-Agent：
+
+```bash
+python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
+  --output "/absolute/path/file.zip" \
+  --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+  --json
+```
+
+`User-Agent` 不能放入 `--headers-file`，这样可以避免重复大小写字段。User-Agent 会参与续传身份计算；更换它时，旧任务不会被混用，需要确认后使用 `--restart` 重新开始。
+
 ## 实时进度
 
 下载器默认使用 `--progress auto`：交互式终端动态刷新单行进度，日志或管道逐行输出。进度包含百分比、已完成大小、速度、预计剩余时间和分片数。

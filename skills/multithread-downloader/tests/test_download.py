@@ -423,6 +423,20 @@ class DownloaderTests(unittest.TestCase):
                 self.assertNotIn(secret, process.stdout + process.stderr + persisted)
             self.assertEqual(server.requests[0]["headers"]["Authorization"], token)
 
+    def test_custom_user_agent_is_sent(self):
+        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        with Fixture() as server:
+            result, _ = self.invoke(server.url, "--user-agent", user_agent)
+            self.check_success(result)
+            self.assertTrue(all(request["headers"].get("User-Agent") == user_agent for request in server.requests))
+
+    def test_user_agent_header_file_is_rejected(self):
+        headers = self.path / "headers.json"
+        headers.write_text(json.dumps({"User-Agent": "Mozilla/5.0"}))
+        with Fixture() as server:
+            self.invoke(server.url, "--headers-file", str(headers), expected=2)
+            self.assertEqual(server.requests, [])
+
     def test_cross_origin_redirect_strips_custom_and_standard_credentials(self):
         headers = self.path / "headers.json"
         headers.write_text(json.dumps({"Authorization": "Bearer abc", "Cookie": "session=xyz", "X-Api-Key": "secret", "Referer": "private"}))

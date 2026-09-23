@@ -37,6 +37,17 @@ python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
   --output "/absolute/path/file.zip" --progress none --json
 ```
 
+部分站点会要求浏览器 User-Agent。下载器默认发送可识别的 `multithread-downloader/<版本>`，需要模拟浏览器时通过 `--user-agent` 配置；该值会在同源和跨源安全重定向中保持一致，也会纳入续传身份校验：
+
+```bash
+python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
+  --output "/absolute/path/file.zip" \
+  --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+  --json
+```
+
+请求头 JSON 不允许覆盖 `User-Agent`；请统一使用 `--user-agent`，避免大小写重复或续传身份不一致。
+
 4. 长时间下载使用终端会话继续等待，直到得到最终结果；不能把“进程已启动”当成下载成功。进度写入 stderr，最终 JSON 写入 stdout；使用 `--json` 时不会把进度混入 JSON。
 5. 根据结果中的 `verification` 和 `temporary_parts_cleaned` 汇报，提供实际输出路径、字节数、SHA-256；如果是基础校验，明确说“大小与分片结构校验通过，未验证内容哈希”。
 
@@ -53,6 +64,8 @@ python3 "<SKILL_DIR>/scripts/download.py" "https://example.com/file.zip" \
 - 不自动添加 `--restart`。需要重新开始时先说明原因并取得用户同意；它将旧任务保留为 `retained-*`，而不是删除旧分片。
 - 只在新文件验证且原子发布成功后清理本次 `active` 目录。失败、中断和校验不符保留临时文件；此前的 `retained-*` 不自动清理。
 - 同一输出路径有进程锁。成功后保留隐藏工作目录中的 `.lock`，它不是分片也不保存凭据，不要在有任务运行时删除它。
+
+- 默认发送 `multithread-downloader/<版本>` User-Agent；可用 `--user-agent` 指定站点要求的浏览器 User-Agent。修改 User-Agent 会使已有任务停止复用，避免混用不同请求身份。
 
 ## 鉴权与安全
 
